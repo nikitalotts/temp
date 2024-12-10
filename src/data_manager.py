@@ -1,11 +1,13 @@
 import time
 import uuid
-
+import plotly.express as px
 import polars as pl
 import pandas as pd
 from typing import Union, Optional, List
 import os
+from statsmodels.tsa.seasonal import seasonal_decompose
 import plotly
+import statsmodels.api as sm
 
 from methodtools import lru_cache
 
@@ -20,10 +22,12 @@ class DataManager:
             file_path = 'temperature_data.csv'
         self.file_path = file_path
         self.parallel = parallel
-        self.files_dir = os.path.join(os.path.dirname(__file__), 'files_folder')
-
+        # self.files_dir = os.path.join(os.path.dirname(__file__), 'files_folder')
+        self.files_dir = os.path.join("./", 'files_folder')
         self.check_files_dir()
         self.data = self.check_data(self.load_data(file_path))
+        self.table = self.process_data()
+
 
     def check_files_dir(self):
         if not os.path.exists(self.files_dir):
@@ -42,7 +46,7 @@ class DataManager:
         return self.load_data(file_path)
 
     def load_data(self, file_path: str = None) -> Optional[Union[pl.DataFrame, pd.DataFrame]]:
-        print("file_path",file_path)
+        print("file_path", file_path)
         if file_path is None:
             file_path = self.file_path
         try:
@@ -62,81 +66,82 @@ class DataManager:
             print(f"Error during data check: {e}")
             return None
 
-
-    def get_rolling_mean(self) -> Optional[Union[pl.Series, pd.Series]]:
+    @lru_cache()
+    def get_rolling_mean(self, city: str, days: int = 30) -> Optional[Union[pl.Series, pd.Series]]:
         if self.data is None:
             raise ValueError("Data is None")
         try:
-            data = self.data['temperature']
             if self.parallel:
-                return data.rolling_mean(30)
-            return data.rolling(30).mean()
+                return self.data.filter(pl.col("city") == city) \
+                    .select(pl.col("temperature") \
+                            .rolling_mean(window_size=days).alias("rolling_mean"))["rolling_mean"]
+            else:
+                return self.data[self.data["city"] == city]["temperature"] \
+                    .rolling(window=days).mean().reset_index(drop=True)
         except Exception as e:
             print(f"Error calculating rolling mean: {e}")
             return None
 
-    def get_rolling_std(self) -> Optional[Union[pl.Series, pd.Series]]:
-        if self.data is None:
-            raise ValueError("Data is None")
+    @lru_cache()
+    def get_rolling_std(self, city: str, days: int = 30) -> Optional[Union[pl.Series, pd.Series]]:
         try:
-            data = self.data['temperature']
-
             if self.parallel:
-                return data.rolling_std(30)
-
-            return data.rolling(30).std()
+                return self.get_data_by_city(city) \
+                    .select(pl.col("temperature") \
+                            .rolling_std(window_size=days).alias("rolling_std"))["rolling_std"]
+            return self.get_data_by_city(city) \
+                .apply(lambda g: g[g['city'] == city])["temperature"] \
+                .rolling(days).std()
         except Exception as e:
-            print(f"Error calculating rolling mean: {e}")
+            print(f"Error calculating rolling std: {e}")
             return None
 
-    def detect_anomalies(self) -> Optional[Union[pl.Series, pd.Series]]:
+    @lru_cache()
+    def get_data_by_city(self, city: str):
+        return self.table.filter(pl.col("city") == city) if self.parallel\
+            else self.table[self.table["city"] == city]
+
+    @lru_cache()
+    def get_temperature_by_city(self, city: str):
+        return self.get_data_by_city(city)["temperature"]
+
+
+    @lru_cache()
+    def detect_anomalies(self, city: str) -> Optional[Union[pl.Series, pd.Series]]:
         if self.data is None:
             raise ValueError("Data is None")
+        if city is None or city not in self.get_cities():
+            raise ValueError("City value is incorrect")
+
         try:
-            self.rolling_mean = self.get_rolling_mean()
-            self.rolling_std = self.get_rolling_std()
+            city_data = self.get_data_by_city(city)
 
-            lower_bound = self.rolling_mean - 2 * self.rolling_std
-            upper_bound = self.rolling_mean + 2 * self.rolling_std
+            return city_data["is_anomaly"]
 
-            self.anomalies = (self.data['temperature'] < lower_bound) | (self.data['temperature'] > upper_bound)
-
-            return self.anomalies
         except Exception as e:
-            print(f"Error calculating rolling mean: {e}")
-            return None
+            raise ValueError(f"Error during detecting anomalies: {str(e)}")
 
-    def get_trend(self) -> Optional[Union[pl.Series, pd.Series]]:
+    @lru_cache()
+    def get_trend(self, city: str) -> Optional[Union[pl.Series, pd.Series]]:
         if self.data is None:
             raise ValueError("Data is None")
         try:
-            data = self.data['temperature']
+            city_data = self.get_data_by_city(city)
+            trend = self.get_rolling_mean(city, days=30)
 
             if self.parallel:
-                return data.rolling_mean(365)
+                city_data = city_data.with_columns(trend.alias("trend"))
+            else:
+                city_data['trend'] = trend
 
-            return data.rolling(365).mean()
+            return city_data
         except Exception as e:
             print(f"Error calculating trend: {e}")
             return None
 
-    @lru_cache()
-    def get_historical_range(self, season: str) -> Optional[Union[pl.Series, pd.Series]]:
-        if self.data is None:
-            raise ValueError("Data is None")
-        try:
-            if self.parallel:
-                season_data = self.data.filter(self.data['season'] == season)
-            else:
-                season_data = self.data[self.data['season'] == season]
+    def get_describe_statisic(self, city: str):
+        return self.get_data_by_city(city)["temperature"].describe()
 
-            q1 = season_data['temperature'].quantile(0.25)
-            q3 = season_data['temperature'].quantile(0.75)
-
-            return pl.Series([q1, q3]) if self.parallel else pd.Series([q1, q3])
-        except Exception as e:
-            print(f"Error calculating historical range: {e}")
-            return None
 
     def get_data(self) -> Union[pl.DataFrame, pd.DataFrame]:
         return self.data
@@ -144,80 +149,144 @@ class DataManager:
     def get_cities(self) -> Union[pl.Series, pd.Series]:
         return sorted(self.data["city"].unique())
 
+
     @lru_cache()
-    def get_season_by_city(self, city: str):
+    def is_temperature_normal(self, city: str, timestamp: str = None, season: str = None,
+                              current_temp: float = None) -> bool:
+        if city is None or city not in self.get_cities():
+            raise ValueError("City value is incorrect")
+
+        if season is not None and timestamp is not None:
+            raise ValueError("Season and timestamp are both not None")
+
+        data = self.get_data_by_city(city)
+        lower_bound, upper_bound = None, None
         if self.parallel:
-            filtered_data = self.data.filter(self.data["city"] == city)
-            return filtered_data.select("season").to_series()[-1]
+            if season is not None:
+                data = data.filter(pl.col("season") == season)
+                lower_bound, upper_bound = data[0]["lower_bound"], data[0]["upper_bound"]
+
+            if timestamp is not None:
+                data = data.filter(pl.col("timestamp") == timestamp)
+                lower_bound, upper_bound = data[0]["lower_bound"], data[0]["upper_bound"]
         else:
-            return self.data[self.data['city'] == city]['season'].iloc[-1]
+            if season is not None:
+                data = data[data["season"] == season]
 
-    @lru_cache()
-    def is_temperature_anomalous(self, city: str, current_temp: float) -> str:
-        season = self.get_season_by_city(city)
-        season_range = self.get_historical_range(season)
+                lower_bound, upper_bound = data.iloc[0]["lower_bound"], data.iloc[0]["upper_bound"]
 
-        if season_range[0] <= current_temp <= season_range[1]:
-            return "normal"
-        return "anomalous"
+            if timestamp is not None:
+                data = data[data["timestamp"] == timestamp]
 
-    def plot_anomalies(self):
+                lower_bound, upper_bound = data.iloc[0]["lower_bound"], data.iloc[0]["upper_bound"]
+
+        return lower_bound.item() <= current_temp <= upper_bound.item()
+
+    def get_decomposition(self, city: str, period=365):
+        if self.parallel:
+            data = self.get_data_by_city(city).to_pandas().set_index("timestamp")
+        else:
+            data = self.get_data_by_city(city)
+            data.set_index('timestamp', inplace=True)
+
+        decomposition = seasonal_decompose(data['temperature'], model='additive', period=period)
+
+        return decomposition
+
+    def train_arima(self, city: str, order: tuple = (5, 1, 0)):
+        data = self.get_data_by_city(city)
+        temperatures = data['temperature'].to_numpy()
+
+        arima_model = sm.tsa.arima.ARIMA(temperatures, order=order)
+        arima_model_fit = arima_model.fit()
+
+        return arima_model_fit
+
+    def predict_arima(self, city: str, steps: int = 30, order: tuple = (5, 1, 0)):
+        arima_model_fit = self.train_arima(city, order=order)
+        forecast = arima_model_fit.forecast(steps=steps)
+        forecast_index = pd.date_range(start=self.get_data_by_city(city)['timestamp'].max(),
+                                       periods=steps + 1,
+                                       freq='D')[1:]
+        forecast_df = pd.DataFrame(forecast, index=forecast_index, columns=['Predicted Temperature'])
+
+        return forecast_df
+
+    def process_data(self) -> Union[pd.DataFrame, pl.DataFrame]:
         if self.data is None:
-            raise ValueError("Data is None")
+            raise ValueError("Данные не загружены")
+
         try:
-            import plotly.express as px
+            if self.parallel:
+                smoothed_data = self.data.with_columns(
+                    pl.col("temperature").rolling_mean(window_size=30).alias("smoothed_temperature")
+                )
 
-            # Создаем DataFrame с информацией об аномалиях
-            data = self.data.to_pandas() if self.parallel else self.data
-            data['is_anomaly'] = self.anomalies
+                seasonal_stats = smoothed_data.group_by(["city", "season"]).agg([
+                    pl.col("temperature").mean().alias("season_mean"),
+                    pl.col("temperature").std().alias("season_std")
+                ])
 
-            # Построение интерактивного графика с аномалиями
-            fig = px.scatter(
-                data,
-                x="timestamp",
-                y="temperature",
-                color="is_anomaly",
-                color_discrete_map={True: "red", False: "blue"},
-                labels={"is_anomaly": "Anomaly"},
-                title="Temperature Anomalies",
-            )
-            fig.update_traces(marker=dict(size=6), selector=dict(mode="markers"))
-            fig.update_layout(
-                xaxis_title="Date",
-                yaxis_title="Temperature (°C)",
-                legend_title="Anomalies",
-                template="plotly_white",
-            )
-            return fig
+                processed_data = smoothed_data.join(seasonal_stats, on=["city", "season"])
+
+                processed_data = processed_data.with_columns([
+                    (pl.col("season_mean") - 2 * pl.col("season_std")).alias("lower_bound"),
+                    (pl.col("season_mean") + 2 * pl.col("season_std")).alias("upper_bound"),
+                ])
+
+                processed_data = processed_data.with_columns([
+                    (pl.col("temperature") < pl.col("lower_bound")).or_(
+                        pl.col("temperature") > pl.col("upper_bound")
+                    ).alias("is_anomaly")
+                ])
+
+                return processed_data
+
+            else:
+                self.data["smoothed_temperature"] = (
+                    self.data.groupby("city")["temperature"]
+                    .rolling(window=30, min_periods=1)
+                    .mean()
+                    .reset_index(level=0, drop=True)
+                )
+
+                seasonal_stats = self.data.groupby(["city", "season"])["temperature"].agg(
+                    season_mean="mean",
+                    season_std="std"
+                ).reset_index()
+
+                processed_data = pd.merge(
+                    self.data,
+                    seasonal_stats,
+                    on=["city", "season"],
+                    how="left"
+                )
+
+                processed_data["lower_bound"] = (
+                        processed_data["season_mean"] - 2 * processed_data["season_std"]
+                )
+                processed_data["upper_bound"] = (
+                        processed_data["season_mean"] + 2 * processed_data["season_std"]
+                )
+                processed_data["is_anomaly"] = (
+                        (processed_data["temperature"] < processed_data["lower_bound"]) |
+                        (processed_data["temperature"] > processed_data["upper_bound"])
+                )
+
+                return processed_data
+
         except Exception as e:
-            print(f"Error during plotting anomalies: {e}")
+            print(f"Ошибка обработки данных: {e}")
             return None
-
-    def add_data_column(self, name, values):
-        if self.parallel:
-            self.data = self.data.with_columns(pl.Series(name=name, values=values))
-        else:
-            self.data[name] = values
 
 
 def test(file_path: str, parallel: bool = True):
-    print(file_path)
-    data_manager = DataManager(file_path, parallel)
     start_time = time.time()
-    anomalies = data_manager.detect_anomalies()
-    trend = data_manager.get_trend()
-    season_range = data_manager.get_historical_range('summer')
+    data_manager = DataManager(file_path, parallel)
+    data_manager.detect_anomalies("Moscow")
     print("Время выполнения (parallel={}): {}".format(parallel, time.time() - start_time))
 
 
 if __name__ == "__main__":
-    data_manager = DataManager()
-    data_manager.load_data()
-
-    trend = data_manager.get_trend()
-    if trend is not None:
-        stdata_manager.add_data_column("trend", trend)
-        trend_data = data_manager.get_data()
-        x = 1
-    #test('temperature_data.csv', parallel=True)
-    #test('temperature_data.csv', parallel=False)
+    test('temperature_data.csv', parallel=True)
+    test('temperature_data.csv', parallel=False)
